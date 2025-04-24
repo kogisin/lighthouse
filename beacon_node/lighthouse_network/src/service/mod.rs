@@ -16,7 +16,7 @@ use crate::rpc::{
 use crate::types::{
     attestation_sync_committee_topics, fork_core_topics, subnet_from_topic_hash, GossipEncoding,
     GossipKind, GossipTopic, SnappyTransform, Subnet, SubnetDiscovery, ALTAIR_CORE_TOPICS,
-    BASE_CORE_TOPICS, CAPELLA_CORE_TOPICS, DENEB_CORE_TOPICS, LIGHT_CLIENT_GOSSIP_TOPICS,
+    BASE_CORE_TOPICS, CAPELLA_CORE_TOPICS, LIGHT_CLIENT_GOSSIP_TOPICS,
 };
 use crate::EnrExt;
 use crate::Eth2Enr;
@@ -198,15 +198,12 @@ impl<E: EthSpec> Network<E> {
         )?;
 
         // Construct the metadata
-        let custody_subnet_count = ctx.chain_spec.is_peer_das_scheduled().then(|| {
-            if config.subscribe_all_data_column_subnets {
-                ctx.chain_spec.data_column_sidecar_subnet_count
-            } else {
-                ctx.chain_spec.custody_requirement
-            }
+        let custody_group_count = ctx.chain_spec.is_peer_das_scheduled().then(|| {
+            ctx.chain_spec
+                .custody_group_count(config.subscribe_all_data_column_subnets)
         });
         let meta_data =
-            utils::load_or_build_metadata(&config.network_dir, custody_subnet_count, &log);
+            utils::load_or_build_metadata(&config.network_dir, custody_group_count, &log);
         let seq_number = *meta_data.seq_number();
         let globals = NetworkGlobals::new(
             enr,
@@ -227,7 +224,7 @@ impl<E: EthSpec> Network<E> {
 
         let gossipsub_config_params = GossipsubConfigParams {
             message_domain_valid_snappy: ctx.chain_spec.message_domain_valid_snappy,
-            gossip_max_size: ctx.chain_spec.gossip_max_size as usize,
+            gossipsub_max_transmit_size: ctx.chain_spec.max_message_size(),
         };
         let gs_config = gossipsub_config(
             config.network_load,
@@ -285,26 +282,23 @@ impl<E: EthSpec> Network<E> {
 
             let max_topics = ctx.chain_spec.attestation_subnet_count as usize
                 + SYNC_COMMITTEE_SUBNET_COUNT as usize
-                + ctx.chain_spec.blob_sidecar_subnet_count as usize
+                + ctx.chain_spec.blob_sidecar_subnet_count_max() as usize
                 + ctx.chain_spec.data_column_sidecar_subnet_count as usize
                 + BASE_CORE_TOPICS.len()
                 + ALTAIR_CORE_TOPICS.len()
-                + CAPELLA_CORE_TOPICS.len()
-                + DENEB_CORE_TOPICS.len()
+                + CAPELLA_CORE_TOPICS.len() // 0 core deneb and electra topics
                 + LIGHT_CLIENT_GOSSIP_TOPICS.len();
 
             let possible_fork_digests = ctx.fork_context.all_fork_digests();
             let filter = gossipsub::MaxCountSubscriptionFilter {
                 filter: utils::create_whitelist_filter(
                     possible_fork_digests,
-                    ctx.chain_spec.attestation_subnet_count,
+                    &ctx.chain_spec,
                     SYNC_COMMITTEE_SUBNET_COUNT,
-                    ctx.chain_spec.blob_sidecar_subnet_count,
-                    ctx.chain_spec.data_column_sidecar_subnet_count,
                 ),
                 // during a fork we subscribe to both the old and new topics
                 max_subscribed_topics: max_topics * 4,
-                // 418 in theory = (64 attestation + 4 sync committee + 7 core topics + 6 blob topics + 128 column topics) * 2
+                // 424 in theory = (64 attestation + 4 sync committee + 7 core topics + 9 blob topics + 128 column topics) * 2
                 max_subscriptions_per_request: max_topics * 2,
             };
 
@@ -316,7 +310,9 @@ impl<E: EthSpec> Network<E> {
                 )
             });
 
-            let snappy_transform = SnappyTransform::new(gs_config.max_transmit_size());
+            let spec = &ctx.chain_spec;
+            let snappy_transform =
+                SnappyTransform::new(spec.max_payload_size as usize, spec.max_compressed_len());
             let mut gossipsub = Gossipsub::new_with_subscription_filter_and_transform(
                 MessageAuthenticity::Anonymous,
                 gs_config.clone(),
@@ -355,7 +351,7 @@ impl<E: EthSpec> Network<E> {
         };
 
         let network_params = NetworkParams {
-            max_chunk_size: ctx.chain_spec.max_chunk_size as usize,
+            max_payload_size: ctx.chain_spec.max_payload_size as usize,
             ttfb_timeout: ctx.chain_spec.ttfb_timeout(),
             resp_timeout: ctx.chain_spec.resp_timeout(),
         };
@@ -714,10 +710,16 @@ impl<E: EthSpec> Network<E> {
         }
 
         // Subscribe to core topics for the new fork
-        for kind in fork_core_topics::<E>(&new_fork, &self.fork_context.spec) {
+        for kind in fork_core_topics::<E>(
+            &new_fork,
+            &self.fork_context.spec,
+            &self.network_globals.as_topic_config(),
+        ) {
             let topic = GossipTopic::new(kind, GossipEncoding::default(), new_fork_digest);
             self.subscribe(topic);
         }
+
+        // TODO(das): unsubscribe from blob topics at the Fulu fork
 
         // Register the new topics for metrics
         let topics_to_keep_metrics_for = attestation_sync_committee_topics::<E>()
@@ -1234,6 +1236,21 @@ impl<E: EthSpec> Network<E> {
                 debug!(self.log, "Added cached ENR peer to dial queue"; "peer_id" => %peer_id);
             }
         }
+    }
+
+    /// Adds the given `enr` to the trusted peers mapping and tries to dial it
+    /// every heartbeat to maintain the connection.
+    pub fn dial_trusted_peer(&mut self, enr: Enr) {
+        self.peer_manager_mut().add_trusted_peer(enr.clone());
+        self.peer_manager_mut().dial_peer(enr);
+    }
+
+    /// Remove the given peer from the trusted peers mapping if it exists and disconnect
+    /// from it.
+    pub fn remove_trusted_peer(&mut self, enr: Enr) {
+        self.peer_manager_mut().remove_trusted_peer(enr.clone());
+        self.peer_manager_mut()
+            .disconnect_peer(enr.peer_id(), GoodbyeReason::TooManyPeers);
     }
 
     /* Sub-behaviour event handling functions */
@@ -1852,7 +1869,7 @@ impl<E: EthSpec> Network<E> {
                     None
                 }
                 #[allow(unreachable_patterns)]
-                BehaviourEvent::ConnectionLimits(le) => void::unreachable(le),
+                BehaviourEvent::ConnectionLimits(le) => libp2p::core::util::unreachable(le),
             },
             SwarmEvent::ConnectionEstablished { .. } => None,
             SwarmEvent::ConnectionClosed { .. } => None,

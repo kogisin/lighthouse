@@ -9,6 +9,7 @@ use crate::fork_choice_signal::ForkChoiceSignalTx;
 use crate::fork_revert::{reset_fork_choice_to_finalization, revert_to_fork_boundary};
 use crate::graffiti_calculator::{GraffitiCalculator, GraffitiOrigin};
 use crate::head_tracker::HeadTracker;
+use crate::kzg_utils::blobs_to_data_column_sidecars;
 use crate::light_client_server_cache::LightClientServerCache;
 use crate::migrate::{BackgroundMigrator, MigratorConfig};
 use crate::observed_data_sidecars::ObservedDataSidecars;
@@ -297,8 +298,13 @@ where
             .get_blinded_block(&chain.genesis_block_root)
             .map_err(|e| descriptive_db_error("genesis block", &e))?
             .ok_or("Genesis block not found in store")?;
+        // We're resuming from some state in the db so it makes sense to cache it.
         let genesis_state = store
-            .get_state(&genesis_block.state_root(), Some(genesis_block.slot()))
+            .get_state(
+                &genesis_block.state_root(),
+                Some(genesis_block.slot()),
+                true,
+            )
             .map_err(|e| descriptive_db_error("genesis state", &e))?
             .ok_or("Genesis state not found in store")?;
 
@@ -562,9 +568,30 @@ where
             .put_block(&weak_subj_block_root, weak_subj_block.clone())
             .map_err(|e| format!("Failed to store weak subjectivity block: {e:?}"))?;
         if let Some(blobs) = weak_subj_blobs {
-            store
-                .put_blobs(&weak_subj_block_root, blobs)
-                .map_err(|e| format!("Failed to store weak subjectivity blobs: {e:?}"))?;
+            if self
+                .spec
+                .is_peer_das_enabled_for_epoch(weak_subj_block.epoch())
+            {
+                // After PeerDAS recompute columns from blobs to not force the checkpointz server
+                // into exposing another route.
+                let blobs = blobs
+                    .iter()
+                    .map(|blob_sidecar| &blob_sidecar.blob)
+                    .collect::<Vec<_>>();
+                let data_columns =
+                    blobs_to_data_column_sidecars(&blobs, &weak_subj_block, &self.kzg, &self.spec)
+                        .map_err(|e| {
+                            format!("Failed to compute weak subjectivity data_columns: {e:?}")
+                        })?;
+                // TODO(das): only persist the columns under custody
+                store
+                    .put_data_columns(&weak_subj_block_root, data_columns)
+                    .map_err(|e| format!("Failed to store weak subjectivity data_column: {e:?}"))?;
+            } else {
+                store
+                    .put_blobs(&weak_subj_block_root, blobs)
+                    .map_err(|e| format!("Failed to store weak subjectivity blobs: {e:?}"))?;
+            }
         }
 
         // Stage the database's metadata fields for atomic storage when `build` is called.
@@ -820,10 +847,31 @@ where
             ));
         }
 
-        let validator_pubkey_cache = self.validator_pubkey_cache.map(Ok).unwrap_or_else(|| {
-            ValidatorPubkeyCache::new(&head_snapshot.beacon_state, store.clone())
-                .map_err(|e| format!("Unable to init validator pubkey cache: {:?}", e))
-        })?;
+        let validator_pubkey_cache = self
+            .validator_pubkey_cache
+            .map(|mut validator_pubkey_cache| {
+                // If any validators weren't persisted to disk on previous runs, this will use the head state to
+                // "top-up" the in-memory validator cache and its on-disk representation with any missing validators.
+                let pubkey_store_ops = validator_pubkey_cache
+                    .import_new_pubkeys(&head_snapshot.beacon_state)
+                    .map_err(|e| format!("Unable to top-up persisted pubkey cache {:?}", e))?;
+                if !pubkey_store_ops.is_empty() {
+                    // Write any missed validators to disk
+                    debug!(
+                        store.log,
+                        "Topping up validator pubkey cache";
+                        "missing_validators" => pubkey_store_ops.len()
+                    );
+                    store
+                        .do_atomically_with_block_and_blobs_cache(pubkey_store_ops)
+                        .map_err(|e| format!("Unable to write pubkeys to disk {:?}", e))?;
+                }
+                Ok(validator_pubkey_cache)
+            })
+            .unwrap_or_else(|| {
+                ValidatorPubkeyCache::new(&head_snapshot.beacon_state, store.clone())
+                    .map_err(|e| format!("Unable to init validator pubkey cache: {:?}", e))
+            })?;
 
         let migrator_config = self.store_migrator_config.unwrap_or_default();
         let store_migrator = BackgroundMigrator::new(

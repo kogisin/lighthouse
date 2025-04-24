@@ -2,7 +2,7 @@ use account_utils::{read_input_from_user, STDIN_INPUTS_FLAG};
 use beacon_chain::chain_config::{
     DisallowedReOrgOffsets, ReOrgThreshold, DEFAULT_PREPARE_PAYLOAD_LOOKAHEAD_FACTOR,
     DEFAULT_RE_ORG_HEAD_THRESHOLD, DEFAULT_RE_ORG_MAX_EPOCHS_SINCE_FINALIZATION,
-    DEFAULT_RE_ORG_PARENT_THRESHOLD,
+    DEFAULT_RE_ORG_PARENT_THRESHOLD, INVALID_HOLESKY_BLOCK_ROOT,
 };
 use beacon_chain::graffiti_calculator::GraffitiOrigin;
 use beacon_chain::TrustedSetup;
@@ -20,9 +20,10 @@ use lighthouse_network::{multiaddr::Protocol, Enr, Multiaddr, NetworkConfig, Pee
 use sensitive_url::SensitiveUrl;
 use slog::{info, warn, Logger};
 use std::cmp::max;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::net::Ipv6Addr;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::num::NonZeroU16;
@@ -176,11 +177,25 @@ pub fn get_config<E: EthSpec>(
             parse_required(cli_args, "http-duplicate-block-status")?;
 
         client_config.http_api.enable_light_client_server =
-            cli_args.get_flag("light-client-server");
+            !cli_args.get_flag("disable-light-client-server");
     }
 
     if cli_args.get_flag("light-client-server") {
-        client_config.chain.enable_light_client_server = true;
+        warn!(
+            log,
+            "The --light-client-server flag is deprecated. The light client server is enabled \
+             by default"
+        );
+    }
+
+    if cli_args.get_flag("disable-light-client-server") {
+        client_config.chain.enable_light_client_server = false;
+    }
+
+    if let Some(sync_tolerance_epochs) =
+        clap_utils::parse_optional(cli_args, "sync-tolerance-epochs")?
+    {
+        client_config.chain.sync_tolerance_epochs = sync_tolerance_epochs;
     }
 
     if let Some(cache_size) = clap_utils::parse_optional(cli_args, "shuffling-cache-size")? {
@@ -338,6 +353,8 @@ pub fn get_config<E: EthSpec>(
         el_config.builder_header_timeout =
             clap_utils::parse_optional(cli_args, "builder-header-timeout")?
                 .map(Duration::from_millis);
+
+        el_config.disable_builder_ssz_requests = cli_args.get_flag("builder-disable-ssz");
     }
 
     // Set config values from parse values.
@@ -432,6 +449,10 @@ pub fn get_config<E: EthSpec>(
         warn!(log, "The slots-per-restore-point flag is deprecated");
     }
 
+    if let Some(backend) = clap_utils::parse_optional(cli_args, "beacon-node-backend")? {
+        client_config.store.backend = backend;
+    }
+
     if let Some(hierarchy_config) = clap_utils::parse_optional(cli_args, "hierarchy-exponents")? {
         client_config.store.hierarchy_config = hierarchy_config;
     }
@@ -440,6 +461,12 @@ pub fn get_config<E: EthSpec>(
         clap_utils::parse_optional(cli_args, "epochs-per-migration")?
     {
         client_config.chain.epochs_per_migration = epochs_per_migration;
+    }
+
+    if let Some(state_cache_headroom) =
+        clap_utils::parse_optional(cli_args, "state-cache-headroom")?
+    {
+        client_config.store.state_cache_headroom = state_cache_headroom;
     }
 
     if let Some(prune_blobs) = clap_utils::parse_optional(cli_args, "prune-blobs")? {
@@ -648,10 +675,7 @@ pub fn get_config<E: EthSpec>(
         };
     }
 
-    client_config.chain.max_network_size = lighthouse_network::gossip_max_size(
-        spec.bellatrix_fork_epoch.is_some(),
-        spec.gossip_max_size as usize,
-    );
+    client_config.chain.max_network_size = spec.max_payload_size as usize;
 
     if cli_args.get_flag("slasher") {
         let slasher_dir = if let Some(slasher_dir) = cli_args.get_one::<String>("slasher-dir") {
@@ -883,6 +907,40 @@ pub fn get_config<E: EthSpec>(
         .max_gossip_aggregate_batch_size =
         clap_utils::parse_required(cli_args, "beacon-processor-aggregate-batch-size")?;
 
+    if let Some(invalid_block_roots_file_path) =
+        clap_utils::parse_optional::<String>(cli_args, "invalid-block-roots")?
+    {
+        let mut file = std::fs::File::open(invalid_block_roots_file_path)
+            .map_err(|e| format!("Failed to open invalid-block-roots file: {}", e))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|e| format!("Failed to read invalid-block-roots file {}", e))?;
+        let invalid_block_roots: HashSet<Hash256> = contents
+            .split(',')
+            .filter_map(
+                |s| match Hash256::from_str(s.strip_prefix("0x").unwrap_or(s).trim()) {
+                    Ok(block_root) => Some(block_root),
+                    Err(e) => {
+                        warn!(
+                            log,
+                            "Unable to parse invalid block root";
+                            "block_root" => s,
+                            "error" => ?e,
+                        );
+                        None
+                    }
+                },
+            )
+            .collect();
+        client_config.chain.invalid_block_roots = invalid_block_roots;
+    } else if spec
+        .config_name
+        .as_ref()
+        .is_some_and(|network_name| network_name == "holesky")
+    {
+        client_config.chain.invalid_block_roots = HashSet::from([*INVALID_HOLESKY_BLOCK_ROOT]);
+    }
+
     Ok(client_config)
 }
 
@@ -893,12 +951,13 @@ pub fn parse_listening_addresses(
 ) -> Result<ListenAddress, String> {
     let listen_addresses_str = cli_args
         .get_many::<String>("listen-address")
-        .expect("--listen_addresses has a default value");
+        .unwrap_or_default();
     let use_zero_ports = parse_flag(cli_args, "zero-ports");
 
     // parse the possible ips
     let mut maybe_ipv4 = None;
     let mut maybe_ipv6 = None;
+
     for addr_str in listen_addresses_str {
         let addr = addr_str.parse::<IpAddr>().map_err(|parse_error| {
             format!("Failed to parse listen-address ({addr_str}) as an Ip address: {parse_error}")
@@ -908,8 +967,8 @@ pub fn parse_listening_addresses(
             IpAddr::V4(v4_addr) => match &maybe_ipv4 {
                 Some(first_ipv4_addr) => {
                     return Err(format!(
-                                "When setting the --listen-address option twice, use an IpV4 address and an Ipv6 address. \
-                                Got two IpV4 addresses {first_ipv4_addr} and {v4_addr}"
+                                "When setting the --listen-address option twice, use an IPv4 address and an IPv6 address. \
+                                Got two IPv4 addresses {first_ipv4_addr} and {v4_addr}"
                             ));
                 }
                 None => maybe_ipv4 = Some(v4_addr),
@@ -917,8 +976,8 @@ pub fn parse_listening_addresses(
             IpAddr::V6(v6_addr) => match &maybe_ipv6 {
                 Some(first_ipv6_addr) => {
                     return Err(format!(
-                                "When setting the --listen-address option twice, use an IpV4 address and an Ipv6 address. \
-                                Got two IpV6 addresses {first_ipv6_addr} and {v6_addr}"
+                                "When setting the --listen-address option twice, use an IPv4 address and an IPv6 address. \
+                                Got two IPv6 addresses {first_ipv6_addr} and {v6_addr}"
                             ));
                 }
                 None => maybe_ipv6 = Some(v6_addr),
@@ -932,12 +991,11 @@ pub fn parse_listening_addresses(
         .expect("--port has a default value")
         .parse::<u16>()
         .map_err(|parse_error| format!("Failed to parse --port as an integer: {parse_error}"))?;
-    let port6 = cli_args
+    let maybe_port6 = cli_args
         .get_one::<String>("port6")
         .map(|s| str::parse::<u16>(s))
         .transpose()
-        .map_err(|parse_error| format!("Failed to parse --port6 as an integer: {parse_error}"))?
-        .unwrap_or(9090);
+        .map_err(|parse_error| format!("Failed to parse --port6 as an integer: {parse_error}"))?;
 
     // parse the possible discovery ports.
     let maybe_disc_port = cli_args
@@ -973,17 +1031,32 @@ pub fn parse_listening_addresses(
             format!("Failed to parse --quic6-port as an integer: {parse_error}")
         })?;
 
+    // Here we specify the default listening addresses for Lighthouse.
+    // By default, we listen on 0.0.0.0.
+    //
+    // IF the host supports a globally routable IPv6 address, we also listen on ::.
+    if matches!((maybe_ipv4, maybe_ipv6), (None, None)) {
+        maybe_ipv4 = Some(Ipv4Addr::UNSPECIFIED);
+
+        if NetworkConfig::is_ipv6_supported() {
+            maybe_ipv6 = Some(Ipv6Addr::UNSPECIFIED);
+        }
+    }
+
     // Now put everything together
     let listening_addresses = match (maybe_ipv4, maybe_ipv6) {
         (None, None) => {
-            // This should never happen unless clap is broken
-            return Err("No listening addresses provided".into());
+            unreachable!("This path is handled above this match statement");
         }
         (None, Some(ipv6)) => {
             // A single ipv6 address was provided. Set the ports
             if cli_args.value_source("port6") == Some(ValueSource::CommandLine) {
                 warn!(log, "When listening only over IPv6, use the --port flag. The value of --port6 will be ignored.");
             }
+
+            // If we are only listening on ipv6 and the user has specified --port6, lets just use
+            // that.
+            let port = maybe_port6.unwrap_or(port);
 
             // use zero ports if required. If not, use the given port.
             let tcp_port = use_zero_ports
@@ -1051,6 +1124,9 @@ pub fn parse_listening_addresses(
             })
         }
         (Some(ipv4), Some(ipv6)) => {
+            // If --port6 is not set, we use --port
+            let port6 = maybe_port6.unwrap_or(port);
+
             let ipv4_tcp_port = use_zero_ports
                 .then(unused_port::unused_tcp4_port)
                 .transpose()?
@@ -1070,7 +1146,7 @@ pub fn parse_listening_addresses(
                     ipv4_tcp_port + 1
                 });
 
-            // Defaults to 9090 when required
+            // Defaults to 9000 when required
             let ipv6_tcp_port = use_zero_ports
                 .then(unused_port::unused_tcp6_port)
                 .transpose()?
@@ -1409,7 +1485,7 @@ pub fn set_network_config(
     }
 
     // Light client server config.
-    config.enable_light_client_server = parse_flag(cli_args, "light-client-server");
+    config.enable_light_client_server = !parse_flag(cli_args, "disable-light-client-server");
 
     // The self limiter is enabled by default. If the `self-limiter-protocols` flag is not provided,
     // the default params will be used.

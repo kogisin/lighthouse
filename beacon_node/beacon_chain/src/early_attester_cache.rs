@@ -33,7 +33,7 @@ pub struct CacheItem<E: EthSpec> {
 ///
 /// - Produce an attestation without using `chain.canonical_head`.
 /// - Verify that a block root exists (i.e., will be imported in the future) during attestation
-///     verification.
+///   verification.
 /// - Provide a block which can be sent to peers via RPC.
 #[derive(Default)]
 pub struct EarlyAttesterCache<E: EthSpec> {
@@ -145,7 +145,7 @@ impl<E: EthSpec> EarlyAttesterCache<E> {
         self.item
             .read()
             .as_ref()
-            .map_or(false, |item| item.beacon_block_root == block_root)
+            .is_some_and(|item| item.beacon_block_root == block_root)
     }
 
     /// Returns the block, if `block_root` matches the cached item.

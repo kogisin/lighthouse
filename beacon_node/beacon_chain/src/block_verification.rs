@@ -5,7 +5,7 @@
 //! - Verification for gossip blocks (i.e., should we gossip some block from the network).
 //! - Verification for normal blocks (e.g., some block received on the RPC during a parent lookup).
 //! - Verification for chain segments (e.g., some chain of blocks received on the RPC during a
-//!    sync).
+//!   sync).
 //!
 //! The primary source of complexity here is that we wish to avoid doing duplicate work as a block
 //! moves through the verification process. For example, if some block is verified for gossip, we
@@ -92,6 +92,7 @@ use std::fs;
 use std::io::Write;
 use std::sync::Arc;
 use store::{Error as DBError, HotStateSummary, KeyValueStore, StoreOp};
+use strum::AsRefStr;
 use task_executor::JoinHandle;
 use types::{
     data_column_sidecar::DataColumnSidecarError, BeaconBlockRef, BeaconState, BeaconStateError,
@@ -137,7 +138,7 @@ const WRITE_BLOCK_PROCESSING_SSZ: bool = cfg!(feature = "write_ssz_files");
 ///
 /// - The block is malformed/invalid (indicated by all results other than `BeaconChainError`.
 /// - We encountered an error whilst trying to verify the block (a `BeaconChainError`).
-#[derive(Debug)]
+#[derive(Debug, AsRefStr)]
 pub enum BlockError {
     /// The parent block was unknown.
     ///
@@ -207,24 +208,18 @@ pub enum BlockError {
     ///
     /// The block is invalid and the peer is faulty.
     IncorrectBlockProposer { block: u64, local_shuffling: u64 },
-    /// The proposal signature in invalid.
-    ///
-    /// ## Peer scoring
-    ///
-    /// The block is invalid and the peer is faulty.
-    ProposalSignatureInvalid,
     /// The `block.proposal_index` is not known.
     ///
     /// ## Peer scoring
     ///
     /// The block is invalid and the peer is faulty.
     UnknownValidator(u64),
-    /// A signature in the block is invalid (exactly which is unknown).
+    /// A signature in the block is invalid
     ///
     /// ## Peer scoring
     ///
     /// The block is invalid and the peer is faulty.
-    InvalidSignature,
+    InvalidSignature(InvalidSignature),
     /// The provided block is not from a later slot than its parent.
     ///
     /// ## Peer scoring
@@ -287,6 +282,9 @@ pub enum BlockError {
     /// problems to worry about than losing peers, and we're doing the network a favour by
     /// disconnecting.
     ParentExecutionPayloadInvalid { parent_root: Hash256 },
+    /// This is a known invalid block that was listed in Lighthouses configuration.
+    /// At the moment this error is only relevant as part of the Holesky network recovery efforts.
+    KnownInvalidExecutionPayload(Hash256),
     /// The block is a slashable equivocation from the proposer.
     ///
     /// ## Peer scoring
@@ -326,6 +324,17 @@ pub enum BlockError {
     /// We were unable to process this block due to an internal error. It's unclear if the block is
     /// valid.
     InternalError(String),
+}
+
+/// Which specific signature(s) are invalid in a SignedBeaconBlock
+#[derive(Debug)]
+pub enum InvalidSignature {
+    // The outer signature in a SignedBeaconBlock
+    ProposerSignature,
+    // One or more signatures in BeaconBlockBody
+    BlockBodySignatures,
+    // One or more signatures in SignedBeaconBlock
+    Unknown,
 }
 
 impl From<AvailabilityCheckError> for BlockError {
@@ -522,7 +531,9 @@ pub enum BlockSlashInfo<TErr> {
 impl BlockSlashInfo<BlockError> {
     pub fn from_early_error_block(header: SignedBeaconBlockHeader, e: BlockError) -> Self {
         match e {
-            BlockError::ProposalSignatureInvalid => BlockSlashInfo::SignatureInvalid(e),
+            BlockError::InvalidSignature(InvalidSignature::ProposerSignature) => {
+                BlockSlashInfo::SignatureInvalid(e)
+            }
             // `InvalidSignature` could indicate any signature in the block, so we want
             // to recheck the proposer signature alone.
             _ => BlockSlashInfo::SignatureNotChecked(header, e),
@@ -651,7 +662,7 @@ pub fn signature_verify_chain_segment<T: BeaconChainTypes>(
     }
 
     if signature_verifier.verify().is_err() {
-        return Err(BlockError::InvalidSignature);
+        return Err(BlockError::InvalidSignature(InvalidSignature::Unknown));
     }
 
     drop(pubkey_cache);
@@ -854,6 +865,9 @@ impl<T: BeaconChainTypes> GossipVerifiedBlock<T> {
             return Err(BlockError::DuplicateFullyImported(block_root));
         }
 
+        // Do not process a block that is known to be invalid.
+        chain.check_invalid_block_roots(block_root)?;
+
         // Do not process a block that doesn't descend from the finalized root.
         //
         // We check this *before* we load the parent so that we can return a more detailed error.
@@ -963,7 +977,9 @@ impl<T: BeaconChainTypes> GossipVerifiedBlock<T> {
         };
 
         if !signature_is_valid {
-            return Err(BlockError::ProposalSignatureInvalid);
+            return Err(BlockError::InvalidSignature(
+                InvalidSignature::ProposerSignature,
+            ));
         }
 
         chain
@@ -1071,6 +1087,9 @@ impl<T: BeaconChainTypes> SignatureVerifiedBlock<T> {
             .fork_name(&chain.spec)
             .map_err(BlockError::InconsistentFork)?;
 
+        // Check whether the block is a banned block prior to loading the parent.
+        chain.check_invalid_block_roots(block_root)?;
+
         let (mut parent, block) = load_parent(block, chain)?;
 
         let state = cheap_state_advance_to_obtain_committees::<_, BlockError>(
@@ -1097,7 +1116,26 @@ impl<T: BeaconChainTypes> SignatureVerifiedBlock<T> {
                 parent: Some(parent),
             })
         } else {
-            Err(BlockError::InvalidSignature)
+            // Re-verify the proposer signature in isolation to attribute fault
+            let pubkey = pubkey_cache
+                .get(block.message().proposer_index() as usize)
+                .ok_or_else(|| BlockError::UnknownValidator(block.message().proposer_index()))?;
+            if block.as_block().verify_signature(
+                Some(block_root),
+                pubkey,
+                &state.fork(),
+                chain.genesis_validators_root,
+                &chain.spec,
+            ) {
+                // Proposer signature is valid, the invalid signature must be in the body
+                Err(BlockError::InvalidSignature(
+                    InvalidSignature::BlockBodySignatures,
+                ))
+            } else {
+                Err(BlockError::InvalidSignature(
+                    InvalidSignature::ProposerSignature,
+                ))
+            }
         }
     }
 
@@ -1152,7 +1190,9 @@ impl<T: BeaconChainTypes> SignatureVerifiedBlock<T> {
                 consensus_context,
             })
         } else {
-            Err(BlockError::InvalidSignature)
+            Err(BlockError::InvalidSignature(
+                InvalidSignature::BlockBodySignatures,
+            ))
         }
     }
 
@@ -1676,6 +1716,7 @@ impl<T: BeaconChainTypes> ExecutionPendingBlock<T> {
                 parent_eth1_finalization_data,
                 confirmed_state_roots,
                 consensus_context,
+                data_column_recv: None,
             },
             payload_verification_handle,
         })
@@ -1726,7 +1767,22 @@ pub fn check_block_is_finalized_checkpoint_or_descendant<
     fork_choice: &BeaconForkChoice<T>,
     block: B,
 ) -> Result<B, BlockError> {
-    if fork_choice.is_finalized_checkpoint_or_descendant(block.parent_root()) {
+    // If we have a split block newer than finalization then we also ban blocks which are not
+    // descended from that split block. It's important not to try checking `is_descendant` if
+    // finality is ahead of the split and the split block has been pruned, as `is_descendant` will
+    // return `false` in this case.
+    let finalized_slot = fork_choice
+        .finalized_checkpoint()
+        .epoch
+        .start_slot(T::EthSpec::slots_per_epoch());
+    let split = chain.store.get_split_info();
+    let is_descendant_from_split_block = split.slot == 0
+        || split.slot <= finalized_slot
+        || fork_choice.is_descendant(split.block_root, block.parent_root());
+
+    if fork_choice.is_finalized_checkpoint_or_descendant(block.parent_root())
+        && is_descendant_from_split_block
+    {
         Ok(block)
     } else {
         // If fork choice does *not* consider the parent to be a descendant of the finalized block,
@@ -1979,7 +2035,7 @@ impl BlockBlobError for BlockError {
     }
 
     fn proposer_signature_invalid() -> Self {
-        BlockError::ProposalSignatureInvalid
+        BlockError::InvalidSignature(InvalidSignature::ProposerSignature)
     }
 }
 

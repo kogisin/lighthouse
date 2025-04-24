@@ -1,4 +1,4 @@
-use crate::discovery::enr::PEERDAS_CUSTODY_SUBNET_COUNT_ENR_KEY;
+use crate::discovery::enr::PEERDAS_CUSTODY_GROUP_COUNT_ENR_KEY;
 use crate::discovery::{peer_id_to_node_id, CombinedKey};
 use crate::{metrics, multiaddr::Multiaddr, types::Subnet, Enr, EnrExt, Gossipsub, PeerId};
 use itertools::Itertools;
@@ -9,10 +9,11 @@ use std::net::IpAddr;
 use std::time::Instant;
 use std::{cmp::Ordering, fmt::Display};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet},
     fmt::Formatter,
 };
 use sync_status::SyncStatus;
+use types::data_column_custody_group::compute_subnets_for_node;
 use types::{ChainSpec, DataColumnSubnetId, EthSpec};
 
 pub mod client;
@@ -78,6 +79,33 @@ impl<E: EthSpec> PeerDB<E> {
         self.peers.iter()
     }
 
+    pub fn set_trusted_peer(&mut self, enr: Enr) {
+        match self.peers.entry(enr.peer_id()) {
+            Entry::Occupied(mut info) => {
+                let entry = info.get_mut();
+                entry.score = Score::max_score();
+                entry.is_trusted = true;
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(PeerInfo::trusted_peer_info());
+            }
+        }
+    }
+
+    pub fn unset_trusted_peer(&mut self, enr: Enr) {
+        if let Some(info) = self.peers.get_mut(&enr.peer_id()) {
+            info.is_trusted = false;
+            info.score = Score::default();
+        }
+    }
+
+    pub fn trusted_peers(&self) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter_map(|(id, info)| if info.is_trusted { Some(*id) } else { None })
+            .collect()
+    }
+
     /// Gives the ids of all known peers.
     pub fn peer_ids(&self) -> impl Iterator<Item = &PeerId> {
         self.peers.keys()
@@ -127,7 +155,7 @@ impl<E: EthSpec> PeerDB<E> {
         matches!(
             self.connection_status(peer_id),
             Some(PeerConnectionStatus::Disconnected { .. })
-                | Some(PeerConnectionStatus::Unknown { .. })
+                | Some(PeerConnectionStatus::Unknown)
                 | None
         ) && !self.score_state_banned_or_disconnected(peer_id)
     }
@@ -695,8 +723,8 @@ impl<E: EthSpec> PeerDB<E> {
 
         if supernode {
             enr.insert(
-                PEERDAS_CUSTODY_SUBNET_COUNT_ENR_KEY,
-                &spec.data_column_sidecar_subnet_count,
+                PEERDAS_CUSTODY_GROUP_COUNT_ENR_KEY,
+                &spec.number_of_custody_groups,
                 &enr_key,
             )
             .expect("u64 can be encoded");
@@ -714,19 +742,14 @@ impl<E: EthSpec> PeerDB<E> {
         if supernode {
             let peer_info = self.peers.get_mut(&peer_id).expect("peer exists");
             let all_subnets = (0..spec.data_column_sidecar_subnet_count)
-                .map(|csc| csc.into())
+                .map(|subnet_id| subnet_id.into())
                 .collect();
             peer_info.set_custody_subnets(all_subnets);
         } else {
             let peer_info = self.peers.get_mut(&peer_id).expect("peer exists");
             let node_id = peer_id_to_node_id(&peer_id).expect("convert peer_id to node_id");
-            let subnets = DataColumnSubnetId::compute_custody_subnets::<E>(
-                node_id.raw(),
-                spec.custody_requirement,
-                spec,
-            )
-            .expect("should compute custody subnets")
-            .collect();
+            let subnets = compute_subnets_for_node(node_id.raw(), spec.custody_requirement, spec)
+                .expect("should compute custody subnets");
             peer_info.set_custody_subnets(subnets);
         }
 
@@ -753,8 +776,8 @@ impl<E: EthSpec> PeerDB<E> {
                 NewConnectionState::Connected { .. }          // We have established a new connection (peer may not have been seen before)
                     | NewConnectionState::Disconnecting { .. }// We are disconnecting from a peer that may not have been registered before
                     | NewConnectionState::Dialing { .. }      // We are dialing a potentially new peer
-                    | NewConnectionState::Disconnected { .. } // Dialing a peer that responds by a different ID can be immediately
-                                                              // disconnected without having being stored in the db before
+                    | NewConnectionState::Disconnected // Dialing a peer that responds by a different ID can be immediately
+                                                       // disconnected without having being stored in the db before
             ) {
                 warn!(log_ref, "Updating state of unknown peer";
                     "peer_id" => %peer_id, "new_state" => ?new_state);
@@ -1305,7 +1328,7 @@ impl BannedPeersCount {
     pub fn ip_is_banned(&self, ip: &IpAddr) -> bool {
         self.banned_peers_per_ip
             .get(ip)
-            .map_or(false, |count| *count > BANNED_PEERS_PER_IP_THRESHOLD)
+            .is_some_and(|count| *count > BANNED_PEERS_PER_IP_THRESHOLD)
     }
 }
 

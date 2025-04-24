@@ -153,7 +153,7 @@ fn get_sync_status<E: EthSpec>(
     // Lighthouse is "cached and ready" when it has cached enough blocks to cover the start of the
     // current voting period.
     let lighthouse_is_cached_and_ready =
-        latest_cached_block_timestamp.map_or(false, |t| t >= voting_target_timestamp);
+        latest_cached_block_timestamp.is_some_and(|t| t >= voting_target_timestamp);
 
     Some(Eth1SyncStatusData {
         head_block_number,
@@ -369,6 +369,12 @@ pub struct DummyEth1ChainBackend<E: EthSpec>(PhantomData<E>);
 impl<E: EthSpec> Eth1ChainBackend<E> for DummyEth1ChainBackend<E> {
     /// Produce some deterministic junk based upon the current epoch.
     fn eth1_data(&self, state: &BeaconState<E>, _spec: &ChainSpec) -> Result<Eth1Data, Error> {
+        // [New in Electra:EIP6110]
+        if let Ok(deposit_requests_start_index) = state.deposit_requests_start_index() {
+            if state.eth1_deposit_index() == deposit_requests_start_index {
+                return Ok(state.eth1_data().clone());
+            }
+        }
         let current_epoch = state.current_epoch();
         let slots_per_voting_period = E::slots_per_eth1_voting_period() as u64;
         let current_voting_period: u64 = current_epoch.as_u64() / slots_per_voting_period;
@@ -467,6 +473,12 @@ impl<E: EthSpec> CachingEth1Backend<E> {
 
 impl<E: EthSpec> Eth1ChainBackend<E> for CachingEth1Backend<E> {
     fn eth1_data(&self, state: &BeaconState<E>, spec: &ChainSpec) -> Result<Eth1Data, Error> {
+        // [New in Electra:EIP6110]
+        if let Ok(deposit_requests_start_index) = state.deposit_requests_start_index() {
+            if state.eth1_deposit_index() == deposit_requests_start_index {
+                return Ok(state.eth1_data().clone());
+            }
+        }
         let period = E::SlotsPerEth1VotingPeriod::to_u64();
         let voting_period_start_slot = (state.slot() / period) * period;
         let voting_period_start_seconds = slot_start_seconds(

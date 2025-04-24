@@ -5,7 +5,7 @@ mod common;
 use common::Protocol;
 use lighthouse_network::rpc::{methods::*, RequestType};
 use lighthouse_network::service::api_types::AppRequestId;
-use lighthouse_network::{rpc::max_rpc_size, NetworkEvent, ReportSource, Response};
+use lighthouse_network::{NetworkEvent, ReportSource, Response};
 use slog::{debug, warn, Level};
 use ssz::Encode;
 use ssz_types::VariableList;
@@ -15,37 +15,37 @@ use tokio::runtime::Runtime;
 use tokio::time::sleep;
 use types::{
     BeaconBlock, BeaconBlockAltair, BeaconBlockBase, BeaconBlockBellatrix, BlobSidecar, ChainSpec,
-    EmptyBlock, Epoch, EthSpec, FixedBytesExtended, ForkContext, ForkName, Hash256, MinimalEthSpec,
-    Signature, SignedBeaconBlock, Slot,
+    EmptyBlock, Epoch, EthSpec, FixedBytesExtended, ForkName, Hash256, MinimalEthSpec,
+    RuntimeVariableList, Signature, SignedBeaconBlock, Slot,
 };
 
 type E = MinimalEthSpec;
 
 /// Bellatrix block with length < max_rpc_size.
-fn bellatrix_block_small(fork_context: &ForkContext, spec: &ChainSpec) -> BeaconBlock<E> {
+fn bellatrix_block_small(spec: &ChainSpec) -> BeaconBlock<E> {
     let mut block = BeaconBlockBellatrix::<E>::empty(spec);
     let tx = VariableList::from(vec![0; 1024]);
-    let txs = VariableList::from(std::iter::repeat(tx).take(5000).collect::<Vec<_>>());
+    let txs = VariableList::from(std::iter::repeat_n(tx, 5000).collect::<Vec<_>>());
 
     block.body.execution_payload.execution_payload.transactions = txs;
 
     let block = BeaconBlock::Bellatrix(block);
-    assert!(block.ssz_bytes_len() <= max_rpc_size(fork_context, spec.max_chunk_size as usize));
+    assert!(block.ssz_bytes_len() <= spec.max_payload_size as usize);
     block
 }
 
 /// Bellatrix block with length > MAX_RPC_SIZE.
 /// The max limit for a bellatrix block is in the order of ~16GiB which wouldn't fit in memory.
 /// Hence, we generate a bellatrix block just greater than `MAX_RPC_SIZE` to test rejection on the rpc layer.
-fn bellatrix_block_large(fork_context: &ForkContext, spec: &ChainSpec) -> BeaconBlock<E> {
+fn bellatrix_block_large(spec: &ChainSpec) -> BeaconBlock<E> {
     let mut block = BeaconBlockBellatrix::<E>::empty(spec);
     let tx = VariableList::from(vec![0; 1024]);
-    let txs = VariableList::from(std::iter::repeat(tx).take(100000).collect::<Vec<_>>());
+    let txs = VariableList::from(std::iter::repeat_n(tx, 100000).collect::<Vec<_>>());
 
     block.body.execution_payload.execution_payload.transactions = txs;
 
     let block = BeaconBlock::Bellatrix(block);
-    assert!(block.ssz_bytes_len() > max_rpc_size(fork_context, spec.max_chunk_size as usize));
+    assert!(block.ssz_bytes_len() > spec.max_payload_size as usize);
     block
 }
 
@@ -193,7 +193,7 @@ fn test_tcp_blocks_by_range_chunked_rpc() {
         let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
         let rpc_response_altair = Response::BlocksByRange(Some(Arc::new(signed_full_block)));
 
-        let full_block = bellatrix_block_small(&common::fork_context(ForkName::Bellatrix), &spec);
+        let full_block = bellatrix_block_small(&spec);
         let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
         let rpc_response_bellatrix_small =
             Response::BlocksByRange(Some(Arc::new(signed_full_block)));
@@ -455,7 +455,7 @@ fn test_tcp_blocks_by_range_over_limit() {
             }));
 
         // BlocksByRange Response
-        let full_block = bellatrix_block_large(&common::fork_context(ForkName::Bellatrix), &spec);
+        let full_block = bellatrix_block_large(&spec);
         let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
         let rpc_response_bellatrix_large =
             Response::BlocksByRange(Some(Arc::new(signed_full_block)));
@@ -810,17 +810,20 @@ fn test_tcp_blocks_by_root_chunked_rpc() {
         .await;
 
         // BlocksByRoot Request
-        let rpc_request = RequestType::BlocksByRoot(BlocksByRootRequest::new(
-            vec![
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-            ],
-            &spec,
-        ));
+        let rpc_request =
+            RequestType::BlocksByRoot(BlocksByRootRequest::V2(BlocksByRootRequestV2 {
+                block_roots: RuntimeVariableList::from_vec(
+                    vec![
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                    ],
+                    spec.max_request_blocks_upper_bound(),
+                ),
+            }));
 
         // BlocksByRoot Response
         let full_block = BeaconBlock::Base(BeaconBlockBase::<E>::full(&spec));
@@ -831,7 +834,7 @@ fn test_tcp_blocks_by_root_chunked_rpc() {
         let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
         let rpc_response_altair = Response::BlocksByRoot(Some(Arc::new(signed_full_block)));
 
-        let full_block = bellatrix_block_small(&common::fork_context(ForkName::Bellatrix), &spec);
+        let full_block = bellatrix_block_small(&spec);
         let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
         let rpc_response_bellatrix_small =
             Response::BlocksByRoot(Some(Arc::new(signed_full_block)));
@@ -953,21 +956,24 @@ fn test_tcp_blocks_by_root_chunked_rpc_terminates_correctly() {
         .await;
 
         // BlocksByRoot Request
-        let rpc_request = RequestType::BlocksByRoot(BlocksByRootRequest::new(
-            vec![
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-                Hash256::zero(),
-            ],
-            &spec,
-        ));
+        let rpc_request =
+            RequestType::BlocksByRoot(BlocksByRootRequest::V2(BlocksByRootRequestV2 {
+                block_roots: RuntimeVariableList::from_vec(
+                    vec![
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                        Hash256::zero(),
+                    ],
+                    spec.max_request_blocks_upper_bound(),
+                ),
+            }));
 
         // BlocksByRoot Response
         let full_block = BeaconBlock::Base(BeaconBlockBase::<E>::full(&spec));
